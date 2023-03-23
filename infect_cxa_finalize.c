@@ -13,6 +13,9 @@
 #include <auxvector.h>
 
 /* TODO
+ * - Relying on plt is bad - many system binaries are compiled with
+ *   -fno-plt. Need another way to find cxa_finalize (e.g. by partially
+ *   disassembling __do_global_dtors_aux).
  * - Custom parasite infection:
  *   * raw shellcode
  *   * object file
@@ -22,7 +25,8 @@
 #define SHELLCODE_LEN       43
 #define SHELLCODE_JMP_OFFT  37
 
-uint64_t PAGE_SIZE = 0; 
+uint64_t PAGE_SIZE = 0;
+
 uint8_t dummy_shellcode[SHELLCODE_LEN] = {
   0x57,                                         // push rdi
   0x48, 0xb8, 0x41, 0x41, 0x41, 0x41, 0x0a,     // movabs rax, 0xa41414141
