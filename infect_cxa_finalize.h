@@ -38,7 +38,6 @@ struct parasite_data {
 
     uint8_t *text_bytes;
     size_t text_size;
-    size_t total_size;
 };
 
 struct parasite_host {
