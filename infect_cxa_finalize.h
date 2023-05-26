@@ -55,7 +55,7 @@ struct parasite_host {
     size_t no_rela_dyn;
     char *dyn_str;
     uint8_t *do_glob_dtors;
-    uint8_t *jmp_to_payload;
+    uint8_t *hijack_site;
 
     uint8_t *scratch_space;
 };

